@@ -18,6 +18,8 @@ package verticalpodautoscaler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"reflect"
 	"time"
@@ -71,6 +73,8 @@ const (
 
 	// AdmissionControllerAppName The hard-coded name of the VPA admission controller
 	AdmissionControllerAppName = "vpa-admission-controller"
+	// CACertHashAnnotation is the pod template annotation key for tracking CA cert changes
+	CACertHashAnnotation = "vertical-pod-autoscaler.openshift.io/ca-cert-hash"
 	// DefaultSafetyMarginFraction Fraction of usage added as the safety margin to the recommended request. This default
 	// matches the upstream default
 	DefaultSafetyMarginFraction = float64(0.15)
@@ -177,6 +181,9 @@ type Config struct {
 	// control plane (HCP/Hosted Control Plane topology). When true, VPA
 	// components should schedule on worker nodes instead of master nodes.
 	IsExternalControlPlane bool
+	// CACertHash is the SHA-256 hash of the CA certificate data.
+	// When this changes, the admission controller pods will be restarted.
+	CACertHash string
 }
 
 // VerticalPodAutoscalerControllerReconciler reconciles a VerticalPodAutoscalerController object
@@ -207,6 +214,9 @@ func (r *VerticalPodAutoscalerControllerReconciler) Reconcile(ctx context.Contex
 
 	// Fetch the current TLS profile from the cluster APIServer config for the webook's --min-tls-version and --tls-ciphers
 	r.syncTLSProfile(ctx)
+
+	// Fetch the CA certificate hash to track cert rotation
+	r.syncCACertHash(ctx)
 
 	// Fetch the VerticalPodAutoscalerController instance
 	vpa := &autoscalingv1.VerticalPodAutoscalerController{}
@@ -421,6 +431,40 @@ func (r *VerticalPodAutoscalerControllerReconciler) syncTLSProfile(ctx context.C
 
 }
 
+// syncCACertHash fetches the CA certificate ConfigMap and updates the hash in the config.
+// If the fetch or hash computation fails, the existing hash is retained and a warning is logged.
+func (r *VerticalPodAutoscalerControllerReconciler) syncCACertHash(ctx context.Context) {
+	cmNN := types.NamespacedName{
+		Name:      CACertConfigMapName,
+		Namespace: r.Config.Namespace,
+	}
+
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, cmNN, cm); err != nil {
+		if errors.IsNotFound(err) {
+			klog.Warningf("CA ConfigMap not found, CA cert hash will not be updated")
+		} else {
+			klog.Warningf("Failed to fetch CA ConfigMap, using existing hash: %v", err)
+		}
+		return
+	}
+
+	certData, ok := cm.Data["service-ca.crt"]
+	if !ok || certData == "" {
+		klog.Warningf("CA ConfigMap missing service-ca.crt data, CA cert hash will not be updated")
+		return
+	}
+
+	hash := sha256.Sum256([]byte(certData))
+	hashStr := hex.EncodeToString(hash[:])
+
+	if r.Config.CACertHash != hashStr {
+		klog.Infof("CA cert hash updated: %s", hashStr[:16])
+	}
+
+	r.Config.CACertHash = hashStr
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *VerticalPodAutoscalerControllerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Create a default VPAController upon first operator startup
@@ -565,10 +609,23 @@ func (r *VerticalPodAutoscalerControllerReconciler) UpdateAutoscaler(vpa *autosc
 		expectedReplicas = 0
 	}
 
-	// Only comparing podSpec, replicas and release version for now.
-	if equality.Semantic.DeepEqual(existingSpec, expectedSpec) &&
-		equality.Semantic.DeepEqual(existingDeployment.Spec.Replicas, &expectedReplicas) &&
-		util.ReleaseVersionMatches(existingDeployment, r.Config.ReleaseVersion) {
+	// Check if an update is needed by comparing podSpec, replicas, release version, and CA cert hash (for admission controller).
+	needsUpdate := false
+	if !equality.Semantic.DeepEqual(existingSpec, expectedSpec) ||
+		!equality.Semantic.DeepEqual(existingDeployment.Spec.Replicas, &expectedReplicas) ||
+		!util.ReleaseVersionMatches(existingDeployment, r.Config.ReleaseVersion) {
+		needsUpdate = true
+	}
+
+	// For admission controller, also check if CA cert hash annotation needs updating
+	if params.AppName == AdmissionControllerAppName && r.Config.CACertHash != "" {
+		existingAnnotations := existingDeployment.Spec.Template.GetAnnotations()
+		if existingAnnotations == nil || existingAnnotations[CACertHashAnnotation] != r.Config.CACertHash {
+			needsUpdate = true
+		}
+	}
+
+	if !needsUpdate {
 		return false, err
 	}
 
@@ -576,7 +633,12 @@ func (r *VerticalPodAutoscalerControllerReconciler) UpdateAutoscaler(vpa *autosc
 	existingDeployment.Spec.Replicas = &expectedReplicas
 
 	r.UpdateAnnotations(existingDeployment)
-	r.UpdateAnnotations(&existingDeployment.Spec.Template)
+	// Use admission-controller-specific annotations for pod template if applicable
+	if params.AppName == AdmissionControllerAppName {
+		r.UpdateAdmissionControllerAnnotations(&existingDeployment.Spec.Template)
+	} else {
+		r.UpdateAnnotations(&existingDeployment.Spec.Template)
+	}
 	err = r.Update(context.TODO(), existingDeployment)
 	return err == nil, err
 }
@@ -717,6 +779,25 @@ func (r *VerticalPodAutoscalerControllerReconciler) UpdateAnnotations(obj metav1
 	obj.SetAnnotations(annotations)
 }
 
+// UpdateAdmissionControllerAnnotations updates the annotations on the given object
+// to the values currently expected for the admission controller pod template.
+// This includes both the release version and the CA certificate hash.
+func (r *VerticalPodAutoscalerControllerReconciler) UpdateAdmissionControllerAnnotations(obj metav1.Object) {
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+
+	annotations[util.ReleaseVersionAnnotation] = r.Config.ReleaseVersion
+
+	// Add CA cert hash annotation to trigger pod restart on cert rotation
+	if r.Config.CACertHash != "" {
+		annotations[CACertHashAnnotation] = r.Config.CACertHash
+	}
+
+	obj.SetAnnotations(annotations)
+}
+
 // UpdateServiceAnnotations updates the annotations on the given object to the values
 // currently expected by the controller.
 func (r *VerticalPodAutoscalerControllerReconciler) UpdateServiceAnnotations(obj metav1.Object) {
@@ -802,6 +883,11 @@ func (r *VerticalPodAutoscalerControllerReconciler) AutoscalerDeployment(vpa *au
 				Spec: *podSpec,
 			},
 		},
+	}
+
+	// Apply admission-controller-specific annotations to pod template
+	if params.AppName == AdmissionControllerAppName {
+		r.UpdateAdmissionControllerAnnotations(&deployment.Spec.Template)
 	}
 
 	return deployment
