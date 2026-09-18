@@ -610,15 +610,12 @@ func (r *VerticalPodAutoscalerControllerReconciler) UpdateAutoscaler(vpa *autosc
 	}
 
 	// Check if an update is needed by comparing podSpec, replicas, release version, and CA cert hash (for admission controller).
-	needsUpdate := false
-	if !equality.Semantic.DeepEqual(existingSpec, expectedSpec) ||
+	needsUpdate := !equality.Semantic.DeepEqual(existingSpec, expectedSpec) ||
 		!equality.Semantic.DeepEqual(existingDeployment.Spec.Replicas, &expectedReplicas) ||
-		!util.ReleaseVersionMatches(existingDeployment, r.Config.ReleaseVersion) {
-		needsUpdate = true
-	}
+		!util.ReleaseVersionMatches(existingDeployment, r.Config.ReleaseVersion)
 
 	// For admission controller, also check if CA cert hash annotation needs updating
-	if params.AppName == AdmissionControllerAppName && r.Config.CACertHash != "" {
+	if !needsUpdate && params.AppName == AdmissionControllerAppName && r.Config.CACertHash != "" {
 		existingAnnotations := existingDeployment.Spec.Template.GetAnnotations()
 		if existingAnnotations == nil || existingAnnotations[CACertHashAnnotation] != r.Config.CACertHash {
 			needsUpdate = true
