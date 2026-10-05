@@ -25,7 +25,7 @@ metadata:
     healthIndex: B
     olm.skipRange: '>=4.5.0 <5.0.0'
     operatorframework.io/suggested-namespace: openshift-vertical-pod-autoscaler
-    operators.operatorframework.io/builder: operator-sdk-v1.35.0
+    operators.operatorframework.io/builder: operator-sdk-v1.42.3
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
     repository: https://github.com/openshift/vertical-pod-autoscaler-operator
     support: Red Hat
