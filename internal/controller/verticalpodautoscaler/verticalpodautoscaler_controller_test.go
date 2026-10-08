@@ -97,7 +97,7 @@ func TestAdmissionArgs(t *testing.T) {
 		fmt.Sprintf("--kube-api-burst=%.01f", 50.0),
 		"--tls-cert-file=/data/tls-certs/tls.crt",
 		"--tls-private-key=/data/tls-certs/tls.key",
-		"--client-ca-file=/data/tls-ca-certs/service-ca.crt",
+		"--register-webhook=false",
 		"--webhook-timeout-seconds=10",
 	}
 

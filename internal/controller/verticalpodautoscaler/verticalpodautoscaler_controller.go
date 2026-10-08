@@ -18,12 +18,11 @@ package verticalpodautoscaler
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"reflect"
 	"time"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -70,11 +69,11 @@ const (
 	cACertAnnotationName      = "service.beta.openshift.io/inject-cabundle"
 	// CACertConfigMapName The hard-coded name of the configmap containing the CA certs for the VPA webhook
 	CACertConfigMapName = "vpa-tls-ca-certs"
+	// WebhookConfigName The hard-coded name of the VPA MutatingWebhookConfiguration
+	WebhookConfigName = "vpa-webhook-config"
 
 	// AdmissionControllerAppName The hard-coded name of the VPA admission controller
 	AdmissionControllerAppName = "vpa-admission-controller"
-	// CACertHashAnnotation is the pod template annotation key for tracking CA cert changes
-	CACertHashAnnotation = "vertical-pod-autoscaler.openshift.io/ca-cert-hash"
 	// DefaultSafetyMarginFraction Fraction of usage added as the safety margin to the recommended request. This default
 	// matches the upstream default
 	DefaultSafetyMarginFraction = float64(0.15)
@@ -181,9 +180,6 @@ type Config struct {
 	// control plane (HCP/Hosted Control Plane topology). When true, VPA
 	// components should schedule on worker nodes instead of master nodes.
 	IsExternalControlPlane bool
-	// CACertHash is the SHA-256 hash of the CA certificate data.
-	// When this changes, the admission controller pods will be restarted.
-	CACertHash string
 }
 
 // VerticalPodAutoscalerControllerReconciler reconciles a VerticalPodAutoscalerController object
@@ -207,6 +203,8 @@ type VerticalPodAutoscalerControllerReconciler struct {
 // +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=infrastructures,verbs=get
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=list;get;patch;watch
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=mutatingwebhookconfigurations,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=mutatingwebhookconfigurations,verbs=delete,resourceNames=vpa-webhook-config
 
 func (r *VerticalPodAutoscalerControllerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	reqLogger := r.Log.WithValues("Request.Namespace", req.Namespace, "Request.Name", req.Name)
@@ -214,9 +212,6 @@ func (r *VerticalPodAutoscalerControllerReconciler) Reconcile(ctx context.Contex
 
 	// Fetch the current TLS profile from the cluster APIServer config for the webook's --min-tls-version and --tls-ciphers
 	r.syncTLSProfile(ctx)
-
-	// Fetch the CA certificate hash to track cert rotation
-	r.syncCACertHash(ctx)
 
 	// Fetch the VerticalPodAutoscalerController instance
 	vpa := &autoscalingv1.VerticalPodAutoscalerController{}
@@ -360,6 +355,41 @@ func (r *VerticalPodAutoscalerControllerReconciler) Reconcile(ctx context.Contex
 		}
 	}
 
+	// Manage webhook configuration
+	webhook := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	err = r.Get(context.TODO(), types.NamespacedName{Name: WebhookConfigName}, webhook)
+	if err != nil && errors.IsNotFound(err) {
+		if err := r.CreateWebhookConfiguration(vpa); err != nil {
+			errMsg := fmt.Sprintf("Error creating vertical-pod-autoscaler MutatingWebhookConfiguration %v: %v", WebhookConfigName, err)
+			r.Recorder.Eventf(vpaRef, nil, corev1.EventTypeWarning, "FailedCreate", "Create", "%s", errMsg)
+			klog.Error(errMsg)
+
+			return reconcile.Result{}, err
+		}
+
+		msg := fmt.Sprintf("Created VerticalPodAutoscalerController MutatingWebhookConfiguration: %s", WebhookConfigName)
+		r.Recorder.Eventf(vpaRef, nil, corev1.EventTypeNormal, "SuccessfulCreate", "Create", "%s", msg)
+		klog.Info(msg)
+	} else if err == nil {
+		if updated, err := r.UpdateWebhookConfiguration(vpa); err != nil {
+			errMsg := fmt.Sprintf("Error updating vertical-pod-autoscaler MutatingWebhookConfiguration: %v", err)
+			r.Recorder.Eventf(vpaRef, nil, corev1.EventTypeWarning, "FailedUpdate", "Update", "%s", errMsg)
+			klog.Error(errMsg)
+
+			return reconcile.Result{}, err
+		} else if updated {
+			msg := fmt.Sprintf("Updated VerticalPodAutoscalerController MutatingWebhookConfiguration: %s", WebhookConfigName)
+			r.Recorder.Eventf(vpaRef, nil, corev1.EventTypeNormal, "SuccessfulUpdate", "Update", "%s", msg)
+			klog.Info(msg)
+		}
+	} else if err != nil {
+		errMsg := fmt.Sprintf("Error getting vertical-pod-autoscaler MutatingWebhookConfiguration %v: %v", WebhookConfigName, err)
+		r.Recorder.Eventf(vpaRef, nil, corev1.EventTypeWarning, "FailedGetWebhook", "GetWebhook", "%s", errMsg)
+		klog.Error(errMsg)
+
+		return reconcile.Result{}, err
+	}
+
 	for _, policy := range r.NetworkPolicies(vpa) {
 		oldpolicy := &networkingv1.NetworkPolicy{}
 		err = r.Get(context.TODO(), types.NamespacedName{Name: policy.Name, Namespace: r.Config.Namespace}, oldpolicy)
@@ -431,40 +461,6 @@ func (r *VerticalPodAutoscalerControllerReconciler) syncTLSProfile(ctx context.C
 
 }
 
-// syncCACertHash fetches the CA certificate ConfigMap and updates the hash in the config.
-// If the fetch or hash computation fails, the existing hash is retained and a warning is logged.
-func (r *VerticalPodAutoscalerControllerReconciler) syncCACertHash(ctx context.Context) {
-	cmNN := types.NamespacedName{
-		Name:      CACertConfigMapName,
-		Namespace: r.Config.Namespace,
-	}
-
-	cm := &corev1.ConfigMap{}
-	if err := r.Get(ctx, cmNN, cm); err != nil {
-		if errors.IsNotFound(err) {
-			klog.Warningf("CA ConfigMap not found, CA cert hash will not be updated")
-		} else {
-			klog.Warningf("Failed to fetch CA ConfigMap, using existing hash: %v", err)
-		}
-		return
-	}
-
-	certData, ok := cm.Data["service-ca.crt"]
-	if !ok || certData == "" {
-		klog.Warningf("CA ConfigMap missing service-ca.crt data, CA cert hash will not be updated")
-		return
-	}
-
-	hash := sha256.Sum256([]byte(certData))
-	hashStr := hex.EncodeToString(hash[:])
-
-	if r.Config.CACertHash != hashStr {
-		klog.Infof("CA cert hash updated: %s", hashStr[:16])
-	}
-
-	r.Config.CACertHash = hashStr
-}
-
 // SetupWithManager sets up the controller with the Manager.
 func (r *VerticalPodAutoscalerControllerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Create a default VPAController upon first operator startup
@@ -507,6 +503,7 @@ func (r *VerticalPodAutoscalerControllerReconciler) SetupWithManager(mgr ctrl.Ma
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&admissionregistrationv1.MutatingWebhookConfiguration{}).
 		Complete(r)
 }
 
@@ -609,18 +606,10 @@ func (r *VerticalPodAutoscalerControllerReconciler) UpdateAutoscaler(vpa *autosc
 		expectedReplicas = 0
 	}
 
-	// Check if an update is needed by comparing podSpec, replicas, release version, and CA cert hash (for admission controller).
+	// Check if an update is needed by comparing podSpec, replicas, and release version.
 	needsUpdate := !equality.Semantic.DeepEqual(existingSpec, expectedSpec) ||
 		!equality.Semantic.DeepEqual(existingDeployment.Spec.Replicas, &expectedReplicas) ||
 		!util.ReleaseVersionMatches(existingDeployment, r.Config.ReleaseVersion)
-
-	// For admission controller, also check if CA cert hash annotation needs updating
-	if !needsUpdate && params.AppName == AdmissionControllerAppName && r.Config.CACertHash != "" {
-		existingAnnotations := existingDeployment.Spec.Template.GetAnnotations()
-		if existingAnnotations == nil || existingAnnotations[CACertHashAnnotation] != r.Config.CACertHash {
-			needsUpdate = true
-		}
-	}
 
 	if !needsUpdate {
 		return false, err
@@ -630,12 +619,7 @@ func (r *VerticalPodAutoscalerControllerReconciler) UpdateAutoscaler(vpa *autosc
 	existingDeployment.Spec.Replicas = &expectedReplicas
 
 	r.UpdateAnnotations(existingDeployment)
-	// Use admission-controller-specific annotations for pod template if applicable
-	if params.AppName == AdmissionControllerAppName {
-		r.UpdateAdmissionControllerAnnotations(&existingDeployment.Spec.Template)
-	} else {
-		r.UpdateAnnotations(&existingDeployment.Spec.Template)
-	}
+	r.UpdateAnnotations(&existingDeployment.Spec.Template)
 	err = r.Update(context.TODO(), existingDeployment)
 	return err == nil, err
 }
@@ -720,6 +704,43 @@ func (r *VerticalPodAutoscalerControllerReconciler) UpdateCAConfigMap(vpa *autos
 	return err == nil, err
 }
 
+// CreateWebhookConfiguration will create the MutatingWebhookConfiguration for the given
+// VerticalPodAutoscalerController custom resource instance.
+// Note: MutatingWebhookConfiguration is cluster-scoped, so we cannot set an owner reference
+// to a namespace-scoped VPA resource. The webhook is managed through reconciliation instead.
+func (r *VerticalPodAutoscalerControllerReconciler) CreateWebhookConfiguration(vpa *autoscalingv1.VerticalPodAutoscalerController) error {
+	klog.Infof("Creating VerticalPodAutoscalerController MutatingWebhookConfiguration: %s", WebhookConfigName)
+	webhook := r.WebhookConfiguration(vpa)
+
+	return r.Create(context.TODO(), webhook)
+}
+
+// UpdateWebhookConfiguration will retrieve the MutatingWebhookConfiguration for the given
+// VerticalPodAutoscalerController custom resource instance and update it to match the expected spec if needed.
+func (r *VerticalPodAutoscalerControllerReconciler) UpdateWebhookConfiguration(vpa *autoscalingv1.VerticalPodAutoscalerController) (updated bool, err error) {
+	nn := types.NamespacedName{
+		Name: WebhookConfigName,
+	}
+	existingWebhook := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	err = r.Get(context.TODO(), nn, existingWebhook)
+	if err != nil {
+		return false, err
+	}
+
+	merged := existingWebhook.DeepCopy()
+	expected := r.WebhookConfiguration(vpa)
+	// Compare and update webhooks spec and annotations
+	merged.Webhooks = expected.Webhooks
+	merged.Annotations = expected.Annotations
+
+	if equality.Semantic.DeepEqual(existingWebhook, merged) {
+		return false, nil
+	}
+
+	err = r.Update(context.TODO(), merged)
+	return err == nil, err
+}
+
 // RecommenderName returns the expected NamespacedName for the deployment
 // belonging to the given VerticalPodAutoscalerController.
 func (r *VerticalPodAutoscalerControllerReconciler) RecommenderName(vpa *autoscalingv1.VerticalPodAutoscalerController) types.NamespacedName {
@@ -772,25 +793,6 @@ func (r *VerticalPodAutoscalerControllerReconciler) UpdateAnnotations(obj metav1
 	}
 
 	annotations[util.ReleaseVersionAnnotation] = r.Config.ReleaseVersion
-
-	obj.SetAnnotations(annotations)
-}
-
-// UpdateAdmissionControllerAnnotations updates the annotations on the given object
-// to the values currently expected for the admission controller pod template.
-// This includes both the release version and the CA certificate hash.
-func (r *VerticalPodAutoscalerControllerReconciler) UpdateAdmissionControllerAnnotations(obj metav1.Object) {
-	annotations := obj.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-
-	annotations[util.ReleaseVersionAnnotation] = r.Config.ReleaseVersion
-
-	// Add CA cert hash annotation to trigger pod restart on cert rotation
-	if r.Config.CACertHash != "" {
-		annotations[CACertHashAnnotation] = r.Config.CACertHash
-	}
 
 	obj.SetAnnotations(annotations)
 }
@@ -880,11 +882,6 @@ func (r *VerticalPodAutoscalerControllerReconciler) AutoscalerDeployment(vpa *au
 				Spec: *podSpec,
 			},
 		},
-	}
-
-	// Apply admission-controller-specific annotations to pod template
-	if params.AppName == AdmissionControllerAppName {
-		r.UpdateAdmissionControllerAnnotations(&deployment.Spec.Template)
 	}
 
 	return deployment
@@ -1109,28 +1106,12 @@ func (r *VerticalPodAutoscalerControllerReconciler) AdmissionControllerPodSpec(v
 		MountPath: "/data/tls-certs",
 		ReadOnly:  true,
 	})
-	spec.Containers[0].VolumeMounts = append(spec.Containers[0].VolumeMounts, corev1.VolumeMount{
-		Name:      "tls-ca-certs",
-		MountPath: "/data/tls-ca-certs",
-		ReadOnly:  true,
-	})
 	defaultMode := int32(0644)
 	spec.Volumes = append(spec.Volumes, corev1.Volume{
 		Name: "tls-certs",
 		VolumeSource: corev1.VolumeSource{
 			Secret: &corev1.SecretVolumeSource{
 				SecretName:  WebhookCertSecretName,
-				DefaultMode: &defaultMode,
-			},
-		},
-	})
-	spec.Volumes = append(spec.Volumes, corev1.Volume{
-		Name: "tls-ca-certs",
-		VolumeSource: corev1.VolumeSource{
-			ConfigMap: &corev1.ConfigMapVolumeSource{
-				LocalObjectReference: corev1.LocalObjectReference{
-					Name: CACertConfigMapName,
-				},
 				DefaultMode: &defaultMode,
 			},
 		},
@@ -1184,6 +1165,72 @@ func (r *VerticalPodAutoscalerControllerReconciler) CAConfigMap(vpa *autoscaling
 
 	r.UpdateConfigMapAnnotations(cm)
 	return cm
+}
+
+// WebhookConfiguration returns the expected MutatingWebhookConfiguration belonging to the given
+// VerticalPodAutoscalerController.
+func (r *VerticalPodAutoscalerControllerReconciler) WebhookConfiguration(vpa *autoscalingv1.VerticalPodAutoscalerController) *admissionregistrationv1.MutatingWebhookConfiguration {
+	failurePolicy := admissionregistrationv1.Ignore
+	sideEffects := admissionregistrationv1.SideEffectClassNone
+	matchPolicy := admissionregistrationv1.Equivalent
+	timeout := int32(10)
+	port := int32(443)
+	path := "/"
+
+	webhook := &admissionregistrationv1.MutatingWebhookConfiguration{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "admissionregistration.k8s.io/v1",
+			Kind:       "MutatingWebhookConfiguration",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: WebhookConfigName,
+			Annotations: map[string]string{
+				cACertAnnotationName:          "true",
+				util.ReleaseVersionAnnotation: r.Config.ReleaseVersion,
+			},
+		},
+		Webhooks: []admissionregistrationv1.MutatingWebhook{
+			{
+				Name: "vpa.k8s.io",
+				ClientConfig: admissionregistrationv1.WebhookClientConfig{
+					Service: &admissionregistrationv1.ServiceReference{
+						Name:      WebhookServiceName,
+						Namespace: r.Config.Namespace,
+						Path:      &path,
+						Port:      &port,
+					},
+					// CABundle is nil - service-ca will inject it
+				},
+				Rules: []admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{""},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"pods"},
+							Scope:       ptr.To(admissionregistrationv1.AllScopes),
+						},
+					},
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{""},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"pods"},
+							Scope:       ptr.To(admissionregistrationv1.AllScopes),
+						},
+					},
+				},
+				AdmissionReviewVersions: []string{"v1"},
+				SideEffects:             &sideEffects,
+				FailurePolicy:           &failurePolicy,
+				MatchPolicy:             &matchPolicy,
+				TimeoutSeconds:          &timeout,
+			},
+		},
+	}
+
+	return webhook
 }
 
 // objectReference returns a reference to the given object, but will set the

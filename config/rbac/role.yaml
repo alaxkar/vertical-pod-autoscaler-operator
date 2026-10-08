@@ -33,6 +33,25 @@ rules:
   - patch
   - watch
 - apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - mutatingwebhookconfigurations
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resourceNames:
+  - vpa-webhook-config
+  resources:
+  - mutatingwebhookconfigurations
+  verbs:
+  - delete
+- apiGroups:
   - apps
   resources:
   - deployments
