@@ -22,6 +22,7 @@ const (
 	TLSCACertFileArg   AdmissionPluginArg = "--client-ca-file"
 	WebhookTimeout     AdmissionPluginArg = "--webhook-timeout-seconds"
 	RegisterWebhookArg AdmissionPluginArg = "--register-webhook"
+	ReloadCertArg      AdmissionPluginArg = "--reload-cert"
 	MinTLSVersionArg   AdmissionPluginArg = "--min-tls-version"
 	TLSCiphersArg      AdmissionPluginArg = "--tls-ciphers"
 )
@@ -48,6 +49,7 @@ func AdmissionPluginArgs(vpa *v1.VerticalPodAutoscalerController, cfg *Config) [
 		TLSCertFileArg.Value("/data/tls-certs/tls.crt"),
 		TLSKeyFileArg.Value("/data/tls-certs/tls.key"),
 		RegisterWebhookArg.Value("false"),
+		ReloadCertArg.Value("true"),
 		WebhookTimeout.Value("10"),
 	}
 	if !util.ArgExists(s.DeploymentOverrides.Admission.Container.Args, KubeAPIQPSArg.String()) {

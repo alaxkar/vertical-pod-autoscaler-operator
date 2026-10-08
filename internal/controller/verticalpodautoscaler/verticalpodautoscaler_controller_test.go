@@ -98,6 +98,7 @@ func TestAdmissionArgs(t *testing.T) {
 		"--tls-cert-file=/data/tls-certs/tls.crt",
 		"--tls-private-key=/data/tls-certs/tls.key",
 		"--register-webhook=false",
+		"--reload-cert=true",
 		"--webhook-timeout-seconds=10",
 	}
 
