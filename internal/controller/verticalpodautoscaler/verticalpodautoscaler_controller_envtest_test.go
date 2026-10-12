@@ -177,7 +177,6 @@ var _ = Describe("VerticalPodAutoscalerController Controller", Ordered, func() {
 			Eventually(func() error {
 				return k8sClient.Get(testCtx, vpaControllerNN, vpaController)
 			}, timeout, interval).Should(Succeed())
-			originalResourceVersion := vpaController.ResourceVersion
 
 			// Delete namespace annotation
 			vpaNamespace := &corev1.Namespace{}
@@ -195,10 +194,13 @@ var _ = Describe("VerticalPodAutoscalerController Controller", Ordered, func() {
 			// Trigger ensureVPAController
 			Expect(vpaReconciler.ensureVPAController(testCtx)).To(Succeed())
 
-			// Check that controller was not modified
+			// Check that controller exists and has finalizer added by reconciliation
 			vpaController = &autoscalingv1.VerticalPodAutoscalerController{}
-			Expect(k8sClient.Get(testCtx, vpaControllerNN, vpaController)).To(Succeed())
-			Expect(vpaController.ResourceVersion).To(Equal(originalResourceVersion))
+			Eventually(func(g Gomega) {
+				err := k8sClient.Get(testCtx, vpaControllerNN, vpaController)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(vpaController.Finalizers).To(ContainElement(WebhookFinalizerName))
+			}, timeout, interval).Should(Succeed())
 
 			// Check that annotation is added to namespace
 			vpaNamespace = &corev1.Namespace{}

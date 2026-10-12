@@ -71,6 +71,8 @@ const (
 	CACertConfigMapName = "vpa-tls-ca-certs"
 	// WebhookConfigName The hard-coded name of the VPA MutatingWebhookConfiguration
 	WebhookConfigName = "vpa-webhook-config"
+	// WebhookFinalizerName is the finalizer for cleaning up webhook configuration
+	WebhookFinalizerName = "verticalpodautoscalercontroller.autoscaling.openshift.io/webhook-finalizer"
 
 	// AdmissionControllerAppName The hard-coded name of the VPA admission controller
 	AdmissionControllerAppName = "vpa-admission-controller"
@@ -224,6 +226,29 @@ func (r *VerticalPodAutoscalerControllerReconciler) Reconcile(ctx context.Contex
 	}
 
 	vpaRef := r.objectReference(vpa)
+
+	// Handle deletion - clean up webhook configuration
+	if vpa.DeletionTimestamp != nil {
+		if controllerutil.ContainsFinalizer(vpa, WebhookFinalizerName) {
+			if err := r.cleanupWebhookConfiguration(); err != nil {
+				klog.Errorf("Error cleaning up webhook configuration: %v", err)
+				return reconcile.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(vpa, WebhookFinalizerName)
+			if err := r.Update(context.TODO(), vpa); err != nil {
+				return reconcile.Result{}, err
+			}
+		}
+		return reconcile.Result{}, nil
+	}
+
+	// Add finalizer if not present
+	if !controllerutil.ContainsFinalizer(vpa, WebhookFinalizerName) {
+		controllerutil.AddFinalizer(vpa, WebhookFinalizerName)
+		if err := r.Update(context.TODO(), vpa); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
 
 	if err := r.ensureDeployments(vpa, vpaRef); err != nil {
 		return reconcile.Result{}, err
@@ -440,6 +465,18 @@ func (r *VerticalPodAutoscalerControllerReconciler) ensureNetworkPolicies(vpa *a
 	return nil
 }
 
+func (r *VerticalPodAutoscalerControllerReconciler) cleanupWebhookConfiguration() error {
+	webhook := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	err := r.Get(context.TODO(), types.NamespacedName{Name: WebhookConfigName}, webhook)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return r.Delete(context.TODO(), webhook)
+}
+
 // syncTLSProfile fetches the current cluster TLS profile and updates the config.
 // If the fetch fails, the existing profile is retained.
 func (r *VerticalPodAutoscalerControllerReconciler) syncTLSProfile(ctx context.Context) {
@@ -503,7 +540,21 @@ func (r *VerticalPodAutoscalerControllerReconciler) SetupWithManager(mgr ctrl.Ma
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
-		Owns(&admissionregistrationv1.MutatingWebhookConfiguration{}).
+		Watches(
+			&admissionregistrationv1.MutatingWebhookConfiguration{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				webhook, ok := obj.(*admissionregistrationv1.MutatingWebhookConfiguration)
+				if !ok || webhook.Name != WebhookConfigName {
+					return nil
+				}
+				return []reconcile.Request{{
+					NamespacedName: types.NamespacedName{
+						Name:      r.Config.Name,
+						Namespace: r.Config.Namespace,
+					},
+				}}
+			}),
+		).
 		Complete(r)
 }
 
@@ -729,9 +780,15 @@ func (r *VerticalPodAutoscalerControllerReconciler) UpdateWebhookConfiguration(v
 
 	merged := existingWebhook.DeepCopy()
 	expected := r.WebhookConfiguration(vpa)
-	// Compare and update webhooks spec and annotations
-	merged.Webhooks = expected.Webhooks
+	// Update annotations
 	merged.Annotations = expected.Annotations
+	// Update webhook spec but preserve service-ca injected caBundle
+	if len(expected.Webhooks) > 0 && len(merged.Webhooks) > 0 {
+		// Preserve existing caBundle (service-ca injects this)
+		existingCABundle := merged.Webhooks[0].ClientConfig.CABundle
+		merged.Webhooks[0] = expected.Webhooks[0]
+		merged.Webhooks[0].ClientConfig.CABundle = existingCABundle
+	}
 
 	if equality.Semantic.DeepEqual(existingWebhook, merged) {
 		return false, nil
